@@ -1,0 +1,356 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: VaidyaMitra - Privacy-First Clinical Intelligence Platform for Bharat
+
+Globals:
+  Function:
+    Timeout: 30
+    Runtime: python3.11
+    MemorySize: 512
+    Environment:
+      Variables:
+        AI_MODE: bedrock
+        AWS_REGION_NAME: !Ref AWS::Region
+        DYNAMODB_TABLE_PREFIX: vaidyamitra_
+        S3_BUCKET_NAME: !Ref DataBucket
+        BEDROCK_MODEL_ID: meta.llama3-8b-instruct-v1:0
+        BEDROCK_EMBEDDING_MODEL_ID: amazon.titan-embed-text-v2:0
+
+Resources:
+  # ============================
+  # API Gateway
+  # ============================
+  VaidyaMitraApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-API-Key,Authorization'"
+        AllowOrigin: "'*'"
+      Auth:
+        ApiKeyRequired: true
+      MethodSettings:
+        - ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 50
+          HttpMethod: "*"
+          ResourcePath: "/*"
+
+  # ============================
+  # Lambda Functions
+  # ============================
+  SubmitClinicalDataFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: vaidyamitra-submit-clinical-data
+      Handler: lambda_handlers.submit_clinical_data_handler
+      CodeUri: backend/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ClinicalVisitsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PrivacyAuditLogsTable
+        - S3CrudPolicy:
+            BucketName: !Ref DataBucket
+        - Statement:
+            Effect: Allow
+            Action: bedrock:InvokeModel
+            Resource: "*"
+      Events:
+        SubmitData:
+          Type: Api
+          Properties:
+            RestApiId: !Ref VaidyaMitraApi
+            Path: /api/v1/clinical-data
+            Method: post
+
+  GenerateSummaryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: vaidyamitra-generate-summary
+      Handler: lambda_handlers.generate_summary_handler
+      CodeUri: backend/
+      Timeout: 60
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ClinicalVisitsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ClinicalSummariesTable
+        - Statement:
+            Effect: Allow
+            Action: bedrock:InvokeModel
+            Resource: "*"
+      Events:
+        GetSummary:
+          Type: Api
+          Properties:
+            RestApiId: !Ref VaidyaMitraApi
+            Path: /api/v1/summary/{patient_id}
+            Method: get
+
+  PredictDiseaseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: vaidyamitra-predict-disease
+      Handler: lambda_handlers.predict_disease_handler
+      CodeUri: backend/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DiseasePredictionsTable
+        - Statement:
+            Effect: Allow
+            Action: bedrock:InvokeModel
+            Resource: "*"
+      Events:
+        Predict:
+          Type: Api
+          Properties:
+            RestApiId: !Ref VaidyaMitraApi
+            Path: /api/v1/predict-disease
+            Method: post
+
+  GenericMedicineFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: vaidyamitra-generic-medicine
+      Handler: lambda_handlers.generic_medicine_handler
+      CodeUri: backend/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DrugKnowledgeBaseTable
+        - Statement:
+            Effect: Allow
+            Action: bedrock:InvokeModel
+            Resource: "*"
+      Events:
+        FindGeneric:
+          Type: Api
+          Properties:
+            RestApiId: !Ref VaidyaMitraApi
+            Path: /api/v1/generic-medicine
+            Method: post
+
+  UploadPDFFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: vaidyamitra-upload-pdf
+      Handler: lambda_handlers.upload_pdf_handler
+      CodeUri: backend/
+      Timeout: 60
+      MemorySize: 1024
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref DataBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ClinicalVisitsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PrivacyAuditLogsTable
+        - Statement:
+            Effect: Allow
+            Action: bedrock:InvokeModel
+            Resource: "*"
+      Events:
+        Upload:
+          Type: Api
+          Properties:
+            RestApiId: !Ref VaidyaMitraApi
+            Path: /api/v1/upload-report
+            Method: post
+
+  ProcessQueryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: vaidyamitra-process-query
+      Handler: lambda_handlers.process_query_handler
+      CodeUri: backend/
+      Timeout: 60
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ClinicalVisitsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RAGEmbeddingsTable
+        - Statement:
+            Effect: Allow
+            Action: bedrock:InvokeModel
+            Resource: "*"
+      Events:
+        Query:
+          Type: Api
+          Properties:
+            RestApiId: !Ref VaidyaMitraApi
+            Path: /api/v1/query
+            Method: post
+
+  # ============================
+  # S3 Bucket
+  # ============================
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "vaidyamitra-data-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldReports
+            Status: Enabled
+            Prefix: reports/
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+          - Id: CleanupTempFiles
+            Status: Enabled
+            Prefix: temp/
+            ExpirationInDays: 7
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ============================
+  # DynamoDB Tables
+  # ============================
+  ClinicalVisitsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: vaidyamitra_clinical_visits
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: patient_id
+          AttributeType: S
+        - AttributeName: visit_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: patient_id
+          KeyType: HASH
+        - AttributeName: visit_id
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  ClinicalSummariesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: vaidyamitra_clinical_summaries
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: patient_id
+          AttributeType: S
+        - AttributeName: summary_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: patient_id
+          KeyType: HASH
+        - AttributeName: summary_id
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+
+  DiseasePredictionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: vaidyamitra_disease_predictions
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: prediction_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: prediction_id
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+
+  DrugKnowledgeBaseTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: vaidyamitra_drug_knowledge_base
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: drug_id
+          AttributeType: S
+        - AttributeName: brand_name
+          AttributeType: S
+        - AttributeName: generic_name
+          AttributeType: S
+      KeySchema:
+        - AttributeName: drug_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: brand_name_index
+          KeySchema:
+            - AttributeName: brand_name
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: generic_name_index
+          KeySchema:
+            - AttributeName: generic_name
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+
+  PrivacyAuditLogsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: vaidyamitra_privacy_audit_logs
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: event_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: event_id
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  ChangeReportsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: vaidyamitra_change_reports
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: patient_id
+          AttributeType: S
+        - AttributeName: report_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: patient_id
+          KeyType: HASH
+        - AttributeName: report_id
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+
+  RAGEmbeddingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: vaidyamitra_rag_embeddings
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: doc_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: doc_id
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${VaidyaMitraApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+  DataBucketName:
+    Description: S3 Data Bucket
+    Value: !Ref DataBucket
